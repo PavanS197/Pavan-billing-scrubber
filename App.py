@@ -3,13 +3,15 @@ import pandas as pd
 import io
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Billing Scrubber Pro", layout="wide")
+st.set_page_config(page_title="Billing Scrubber Pro", layout="wide", page_icon="🏥")
 
 # --- 1. DATA CLEANING HELPER ---
 def clean_code(val):
     if pd.isna(val) or str(val).strip() == "": 
         return ""
+    # Strip decimals (.0), whitespace, and uppercase
     s = str(val).split('.')[0].strip().upper()
+    # Padding for Anesthesia: restore leading zeros (e.g., 100 -> 00100)
     if s.isdigit() and len(s) < 5:
         s = s.zfill(5)
     return s
@@ -19,12 +21,14 @@ def clean_code(val):
 def load_master_data(uploaded_file):
     try:
         with pd.ExcelFile(uploaded_file) as xls:
+            # Build valid CPT set by scanning all sheets
             all_valid_codes = set()
             for sheet in xls.sheet_names:
                 df_sheet = pd.read_excel(xls, sheet)
                 for col in df_sheet.columns:
                     all_valid_codes.update(df_sheet[col].dropna().apply(clean_code))
             
+            # Load MUE and NCCI logic
             mue_df = pd.read_excel(xls, 'MUE_Edits') if 'MUE_Edits' in xls.sheet_names else pd.DataFrame()
             ncci_df = pd.read_excel(xls, 'NCCI_Edits') if 'NCCI_Edits' in xls.sheet_names else pd.DataFrame()
             
@@ -45,13 +49,14 @@ def run_validation(df, data):
     for i, row in df.iterrows():
         mods = [m.strip().upper() for m in str(row.get('Modifier', '')).replace(',', ' ').split() if m.strip()]
         
-        # Dynamic CPT-Unit Pairing
+        # Identify CPT-Unit pairs based on column order (CPT followed by Units)
         cpt_unit_pairs = []
         for idx, col in enumerate(col_names):
             if 'CPT' in col.upper():
                 cpt_val = clean_code(row[col])
                 if cpt_val:
                     units_val = 1
+                    # Check column immediately to the right for "Units"
                     if idx + 1 < len(col_names) and 'UNIT' in col_names[idx+1].upper():
                         val = row[col_names[idx+1]]
                         units_val = val if pd.notna(val) and str(val).strip() != "" else 0
@@ -95,11 +100,12 @@ st.title("🏥 Billing Scrubber Pro")
 
 with st.sidebar:
     st.header("📂 Data Center")
-    master_file = st.file_uploader("1. Master Data", type=['xlsx'])
-    claim_file = st.file_uploader("2. Claim Entry", type=['xlsx'])
-    if st.button("♻️ Reset Cache"):
+    master_file = st.file_uploader("1. Upload Master Data (48MB max)", type=['xlsx'])
+    claim_file = st.file_uploader("2. Upload Claim Entry", type=['xlsx'])
+    
+    if st.button("♻️ Reset App Cache"):
         st.cache_data.clear()
-        st.rerun()
+        st.success("Cache cleared!")
 
 if master_file and claim_file:
     data = load_master_data(master_file)
@@ -107,48 +113,42 @@ if master_file and claim_file:
         input_df = pd.read_excel(claim_file)
         final_df, error_codes = run_validation(input_df, data)
         
-        # --- TOP LEVEL METRICS ---
-        st.subheader("📊 Performance Summary")
+        # Performance Summary
+        st.subheader("📊 Audit Overview")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Rows", len(final_df))
+        m1.metric("Total Claims", len(final_df))
         m2.metric("Accepted ✅", len(final_df[final_df['Status'] == 'ACCEPTED']))
         m3.metric("Rejected ❌", len(final_df[final_df['Status'] == 'REJECTED']), delta_color="inverse")
 
-        # --- TREND ANALYTICS ---
+        # Rejection Analytics
         if error_codes:
-            st.subheader("📈 Rejection Hotspots (Top CPTs)")
+            st.subheader("📈 Top Denial Hotspots (by CPT)")
             counts = pd.Series(error_codes).value_counts().reset_index()
-            counts.columns = ['CPT Code', 'Count']
-            st.bar_chart(data=counts, x='CPT Code', y='Count', color="#FF4B4B")
+            counts.columns = ['CPT Code', 'Error Count']
+            st.bar_chart(data=counts, x='CPT Code', y='Error Count', color="#FF4B4B")
         
-        # --- SEARCH BAR ---
+        # Search and Global Filter
         st.divider()
-        search_query = st.text_input("🔍 Search Claims (Type Claim ID, CPT, or Error Type...)", "").strip().upper()
+        search_col1, search_col2 = st.columns([2, 1])
+        with search_col1:
+            query = st.text_input("🔍 Search Claims (ID, CPT, or Reason)", "").strip().upper()
+        with search_col2:
+            status_filter = st.selectbox("Filter by Status", ["All", "REJECTED", "ACCEPTED"])
 
-        # Apply filtering based on search
-        if search_query:
-            # We search across Claim_ID and Validation_Results
-            mask = final_df.apply(lambda row: search_query in str(row['Claim_ID']).upper() or 
-                                              search_query in str(row['Validation_Results']).upper(), axis=1)
-            display_df = final_df[mask]
-        else:
-            display_df = final_df
+        # Filter Logic
+        filtered_df = final_df.copy()
+        if status_filter != "All":
+            filtered_df = filtered_df[filtered_df['Status'] == status_filter]
+        if query:
+            mask = filtered_df.apply(lambda r: query in str(r.values).upper(), axis=1)
+            filtered_df = filtered_df[mask]
 
-        # --- TABS ---
-        tab1, tab2, tab3 = st.tabs(["❌ Rejected Claims", "✅ Accepted Claims", "📂 Filtered View"])
+        # Results Display
+        st.write(f"Showing {len(filtered_df)} results")
+        st.dataframe(filtered_df, use_container_width=True)
         
-        with tab1:
-            st.dataframe(final_df[final_df['Status'] == 'REJECTED'], use_container_width=True)
-        with tab2:
-            st.dataframe(final_df[final_df['Status'] == 'ACCEPTED'], use_container_width=True)
-        with tab3:
-            st.write(f"Showing {len(display_df)} results for search: '{search_query}'")
-            st.dataframe(display_df, use_container_width=True)
-        
-        # --- DOWNLOAD ---
+        # Export
         st.divider()
         buffer = io.BytesIO()
         final_df.to_excel(buffer, index=False)
-        st.download_button("📥 Export Audit Report", buffer.getvalue(), "Scrubbed_Audit_Report.xlsx")
-else:
-    st.info("Upload your Excel files to start the automated audit.")
+        st.download_button("📥 Download Audit Report", buffer.getvalue(), "Billing_Audit_Report.xlsx")
