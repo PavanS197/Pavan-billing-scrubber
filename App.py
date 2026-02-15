@@ -7,13 +7,54 @@ import google.generativeai as genai
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Billing AI Scrubber", layout="wide")
 
-# --- DATA CLEANING HELPER (CRITICAL FOR VALIDATION) ---
+# --- IMPROVED DATA CLEANING (FIXES INVALID CPT ERRORS) ---
 def clean_code(val):
-    """Strips .0 and whitespace to ensure 11042.0 becomes 11042"""
-    if pd.isna(val) or val == "": return ""
+    """
+    Standardizes CPT/DX codes:
+    - Removes .0 from Excel floats
+    - Handles leading zeros for Anesthesia
+    - Strips whitespace
+    """
+    if pd.isna(val) or str(val).strip() == "": 
+        return ""
+    
+    # Convert to string and strip spaces
     s = str(val).strip().upper()
-    if s.endswith('.0'): s = s[:-2]
+    
+    # Remove trailing .0 from float-style strings
+    if s.endswith('.0'):
+        s = s[:-2]
+    
+    # Padding for Anesthesia: If it's a numeric code less than 5 digits
+    if s.isdigit() and len(s) < 5:
+        # Only pad if it's likely a procedure code, not a unit count
+        s = s.zfill(5)
+        
     return s
+
+# --- AI DENIAL PREDICTOR (STABLE VERSION) ---
+def check_ai_status(api_key):
+    if not api_key: return False
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('models/gemini-1.5-flash-latest')
+        model.generate_content("Ping", generation_config={"max_output_tokens": 1})
+        return True
+    except:
+        return False
+
+def get_ai_prediction(cpt_list, dx_list, api_key):
+    if not api_key or not cpt_list: return "N/A", "N/A"
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('models/gemini-1.5-flash-latest')
+        prompt = f"Analyze CPTs {cpt_list} with DX {dx_list}. Predict denial risk for medical necessity. Format: RISK: [High/Medium/Low] | REASON: [Short explanation]"
+        response = model.generate_content(prompt)
+        res_text = response.text
+        risk = "High" if "High" in res_text else ("Medium" if "Medium" in res_text else "Low")
+        return risk, res_text
+    except Exception as e:
+        return "AI Error", str(e)
 
 # --- CACHED DATA LOADING ---
 @st.cache_data
@@ -24,7 +65,7 @@ def load_master_data(uploaded_master):
             mue_df = pd.read_excel(xls, 'MUE_Edits', skiprows=3)
             ncci_df = pd.read_excel(xls, 'NCCI_Edits')
             
-        # We clean the master data as we load it to ensure perfect matches
+        # Standardize Master Data CPTs
         mue_dict = dict(zip(cpt_df.iloc[:, 0].apply(clean_code), mue_df.iloc[:, 1]))
         ncci_bundles = {(clean_code(r[0]), clean_code(r[1])): str(r[5]) for _, r in ncci_df.iterrows()}
         valid_cpts = set(cpt_df.iloc[:, 0].apply(clean_code))
@@ -34,39 +75,17 @@ def load_master_data(uploaded_master):
         st.error(f"Error reading master file: {e}")
         return None
 
-# --- AI DENIAL PREDICTOR (FIXED 404 ERROR) ---
-def get_ai_prediction(cpt_list, dx_list, api_key):
-    if not api_key or not cpt_list: return "N/A", "N/A"
-    try:
-        genai.configure(api_key=api_key)
-        # Using the updated, stable model name
-        model = genai.GenerativeModel('gemini-1.5-flash') 
-        
-        prompt = f"Analyze CPTs {cpt_list} with DX {dx_list}. Predict denial risk for medical necessity. Format: RISK: [High/Medium/Low] | REASON: [Short explanation]"
-        response = model.generate_content(prompt)
-        res_text = response.text
-        
-        risk = "High" if "High" in res_text else ("Medium" if "Medium" in res_text else "Low")
-        return risk, res_text
-    except Exception as e:
-        return "AI Error", str(e)
-
 # --- SCRUBBING LOGIC ---
 def run_validation(df, data):
     results = []
     cpt_cols = [c for c in df.columns if 'CPT' in str(c).upper()]
-    
     for _, row in df.iterrows():
         units = row.get('Units', 1)
         mods = [m.strip().upper() for m in str(row.get('Modifier', '')).replace(',', ' ').split() if m.strip()]
-        
-        # Clean the input codes before comparing to master data
         row_cpts = [clean_code(row[c]) for c in cpt_cols if pd.notna(row[c]) and str(row[c]).strip() != ""]
         
         row_status, error_count = [], 0
         for cpt in row_cpts:
-            if cpt.isdigit() and len(cpt) < 5: cpt = cpt.zfill(5)
-            
             status_parts = []
             if cpt not in data['valid_cpts']:
                 status_parts.append("❌ Invalid CPT")
@@ -79,7 +98,6 @@ def run_validation(df, data):
                     if (other, cpt) in data['ncci'] and not any(m in ['59', '25', '91'] for m in mods):
                         status_parts.append(f"🚫 Bundled with {other}")
                         error_count += 1
-            
             row_status.append(f"[{cpt}]: " + ("✅ Clean" if not status_parts else " | ".join(status_parts)))
 
         res = row.to_dict()
@@ -94,6 +112,13 @@ st.title("🏥 Billing AI Scrubber")
 with st.sidebar:
     st.header("🔑 AI Settings")
     api_key = st.text_input("Gemini API Key", type="password")
+    
+    if api_key:
+        if check_ai_status(api_key):
+            st.markdown("🟢 **AI Connection: Active**")
+        else:
+            st.markdown("🔴 **AI Connection: Failed**")
+    
     use_ai = st.checkbox("Enable AI Denial Predictor")
     st.header("📂 Data Upload")
     master_file = st.file_uploader("Upload Master Data", type=['xlsx'])
@@ -118,7 +143,7 @@ if master_file and claim_file:
                 processed_df['Risk_Level'] = risks
                 processed_df['AI_Insight'] = insights
 
-        st.subheader("📊 Scrubbing Summary")
+        st.subheader("📊 Summary")
         m1, m2, m3 = st.columns(3)
         m1.metric("Total Claims", len(processed_df))
         m2.metric("Accepted ✅", len(processed_df[processed_df['Status'] == 'ACCEPTED']))
