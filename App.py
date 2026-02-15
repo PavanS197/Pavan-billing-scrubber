@@ -1,70 +1,66 @@
 import streamlit as st
 import pandas as pd
 import io
-import os
 import google.generativeai as genai
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Billing AI Scrubber", layout="wide")
 
-# --- 1. DATA CLEANING (Ensures 11045.0 == 11045) ---
+# --- 1. DATA CLEANING ---
 def clean_code(val):
-    if pd.isna(val) or str(val).strip() == "": 
-        return ""
-    # Strip decimals, spaces, and convert to upper string
+    if pd.isna(val) or str(val).strip() == "": return ""
     s = str(val).split('.')[0].strip().upper()
-    # Handle leading zeros for Anesthesia (100 -> 00100)
-    if s.isdigit() and len(s) < 5:
-        s = s.zfill(5)
+    if s.isdigit() and len(s) < 5: s = s.zfill(5)
     return s
 
-# --- 2. DEEP-SCAN MASTER LOADER ---
-@st.cache_data(show_spinner=True)
-def load_master_data(uploaded_file):
-    try:
-        with pd.ExcelFile(uploaded_file) as xls:
-            # --- VALID CPT DEEP SCAN ---
-            # Instead of looking at one sheet, we scan the whole file for procedure codes
-            all_valid_codes = set()
-            for sheet in xls.sheet_names:
-                df_sheet = pd.read_excel(xls, sheet)
-                # We flatten the entire sheet into one list of codes
-                for col in df_sheet.columns:
-                    all_valid_codes.update(df_sheet[col].dropna().apply(clean_code))
-            
-            # --- MUE & NCCI SPECIFIC LOADING ---
-            # We look for the sheets by name specifically for logic
-            mue_df = pd.read_excel(xls, 'MUE_Edits') if 'MUE_Edits' in xls.sheet_names else pd.DataFrame()
-            ncci_df = pd.read_excel(xls, 'NCCI_Edits') if 'NCCI_Edits' in xls.sheet_names else pd.DataFrame()
-            
-            mue_map = {}
-            if not mue_df.empty:
-                mue_map = dict(zip(mue_df.iloc[:, 0].apply(clean_code), mue_df.iloc[:, 1]))
-                
-            ncci_map = {}
-            if not ncci_df.empty:
-                ncci_map = {(clean_code(r[0]), clean_code(r[1])): str(r[5]) for _, r in ncci_df.iterrows()}
-            
-        return {"valid_cpts": all_valid_codes, "mue": mue_map, "ncci": ncci_map}
-    except Exception as e:
-        st.error(f"Deep Scan Error: {e}")
-        return None
-
-# --- 3. AI AGENT STABLE LOGIC ---
+# --- 2. ADVANCED AI PREDICTOR (WITH AUTO-DISCOVERY) ---
 def get_ai_prediction(cpts, dxs, api_key):
     if not api_key or not cpts: return "Low", "N/A"
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('models/gemini-1.5-flash-latest')
+        
+        # AUTO-DISCOVERY: Find the correct model path available for your key
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        # Prefer Flash 1.5, then Pro, then the first available
+        target_model = 'models/gemini-1.5-flash'
+        if target_model not in available_models:
+            target_model = next((m for m in available_models if 'flash' in m), 
+                               next((m for m in available_models if 'pro' in m), available_models[0]))
+
+        model = genai.GenerativeModel(target_model)
         prompt = f"Analyze CPTs {cpts} with DX {dxs}. Predict denial risk. Format: RISK: [High/Medium/Low] | REASON: [Short explanation]"
+        
         response = model.generate_content(prompt)
         res = response.text
         risk = "High" if "High" in res else ("Medium" if "Medium" in res else "Low")
         return risk, res
     except Exception as e:
-        return "Error", f"AI Connection Failed: {str(e)}"
+        return "Error", f"AI Access Error: {str(e)}"
 
-# --- 4. UI INTERFACE ---
+# --- 3. DEEP-SCAN MASTER LOADER ---
+@st.cache_data(show_spinner=True)
+def load_master_data(uploaded_file):
+    try:
+        with pd.ExcelFile(uploaded_file) as xls:
+            all_valid_codes = set()
+            for sheet in xls.sheet_names:
+                df_sheet = pd.read_excel(xls, sheet)
+                for col in df_sheet.columns:
+                    all_valid_codes.update(df_sheet[col].dropna().apply(clean_code))
+            
+            mue_df = pd.read_excel(xls, 'MUE_Edits') if 'MUE_Edits' in xls.sheet_names else pd.DataFrame()
+            ncci_df = pd.read_excel(xls, 'NCCI_Edits') if 'NCCI_Edits' in xls.sheet_names else pd.DataFrame()
+            
+            mue_map = dict(zip(mue_df.iloc[:, 0].apply(clean_code), mue_df.iloc[:, 1])) if not mue_df.empty else {}
+            ncci_map = {(clean_code(r[0]), clean_code(r[1])): str(r[5]) for _, r in ncci_df.iterrows()} if not ncci_df.empty else {}
+            
+        return {"valid_cpts": all_valid_codes, "mue": mue_map, "ncci": ncci_map}
+    except Exception as e:
+        st.error(f"Master Data Error: {e}")
+        return None
+
+# --- 4. MAIN APP ---
 st.title("🏥 Billing AI Scrubber")
 
 with st.sidebar:
@@ -72,7 +68,7 @@ with st.sidebar:
     api_key = st.text_input("Gemini API Key", type="password")
     use_ai = st.checkbox("Enable AI Denial Predictor")
     
-    if st.button("♻️ Force Reset App Cache"):
+    if st.button("♻️ Force Reset Cache"):
         st.cache_data.clear()
         st.success("Cache Cleared!")
 
@@ -84,8 +80,6 @@ if master_file and claim_file:
     data = load_master_data(master_file)
     if data and st.button("🚀 Run Comprehensive Audit"):
         claims_df = pd.read_excel(claim_file)
-        
-        # --- SCRUBBING ENGINE ---
         results = []
         cpt_cols = [c for c in claims_df.columns if 'CPT' in str(c).upper()]
         dx_cols = [c for c in claims_df.columns if 'DX' in str(c).upper()]
@@ -98,17 +92,14 @@ if master_file and claim_file:
             
             status_msg, errors = [], 0
             for cpt in row_cpts:
-                # 1. Deep Scan Validity Check
                 if cpt not in data['valid_cpts']:
                     status_msg.append(f"[{cpt}]: ❌ Invalid CPT")
                     errors += 1
                 else:
                     msg = []
-                    # 2. MUE Check
                     if cpt in data['mue'] and units > data['mue'][cpt]:
                         msg.append("⚠️ MUE Violation")
                         errors += 1
-                    # 3. NCCI Check
                     for other in row_cpts:
                         if (other, cpt) in data['ncci'] and not any(m in ['59', '25', '91'] for m in mods):
                             msg.append(f"🚫 Bundled with {other}")
@@ -131,4 +122,4 @@ if master_file and claim_file:
         
         buffer = io.BytesIO()
         pd.DataFrame(results).to_excel(buffer, index=False)
-        st.download_button("📥 Download Final Report", buffer.getvalue(), "Scrubbed_AI_Audit.xlsx")
+        st.download_button("📥 Download Final Report", buffer.getvalue(), "Scrubbed_Audit_Results.xlsx")
