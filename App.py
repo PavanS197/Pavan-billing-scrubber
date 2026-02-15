@@ -3,7 +3,7 @@ import pandas as pd
 import io
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Billing Scrubber & Trend Analytics", layout="wide")
+st.set_page_config(page_title="Billing Scrubber & Analytics", layout="wide")
 
 # --- 1. DATA CLEANING ---
 def clean_code(val):
@@ -31,28 +31,49 @@ def load_master_data(uploaded_file):
         st.error(f"Master Data Error: {e}")
         return None
 
-# --- 3. UPDATED SCRUBBING ENGINE ---
+# --- 3. SCRUBBING ENGINE (UPDATED FOR INDIVIDUAL UNITS) ---
 def run_validation(df, data):
     results = []
-    cpt_cols = [c for c in df.columns if 'CPT' in str(c).upper()]
+    col_names = list(df.columns)
     rejection_reasons = [] 
     
-    for _, row in df.iterrows():
-        units = row.get('Units', 1)
+    for i, row in df.iterrows():
+        # Clean modifiers
         mods = [m.strip().upper() for m in str(row.get('Modifier', '')).replace(',', ' ').split() if m.strip()]
-        row_cpts = [clean_code(row[c]) for c in cpt_cols if pd.notna(row[c]) and str(row[c]).strip() != ""]
         
+        # 1. Pair CPTs with their specific Units
+        cpt_unit_pairs = []
+        for idx, col in enumerate(col_names):
+            if 'CPT' in col.upper():
+                cpt_val = clean_code(row[col])
+                if cpt_val:
+                    # Look at the very next column for units
+                    # (Handles 'Units', 'Units.1', 'Units.2', etc.)
+                    units = 1
+                    if idx + 1 < len(col_names) and 'UNIT' in col_names[idx+1].upper():
+                        units = row[col_names[idx+1]]
+                        if pd.isna(units): units = 1
+                    
+                    cpt_unit_pairs.append({'code': cpt_val, 'units': int(units)})
+
         row_summary = []
         is_rejected = False
+        row_codes_only = [p['code'] for p in cpt_unit_pairs]
         
-        for cpt in row_cpts:
+        for pair in cpt_unit_pairs:
+            cpt = pair['code']
+            u = pair['units']
             cpt_errors = []
+            
             if cpt not in data['valid_cpts']:
                 cpt_errors.append("❌ Invalid CPT")
             else:
-                if cpt in data['mue'] and units > data['mue'][cpt]:
-                    cpt_errors.append(f"⚠️ MUE Limit ({data['mue'][cpt]})")
-                for other in row_cpts:
+                # MUE Check using specific units for THIS CPT
+                if cpt in data['mue'] and u > data['mue'][cpt]:
+                    cpt_errors.append(f"⚠️ MUE Limit ({data['mue'][cpt]}) - Billed: {u}")
+                
+                # NCCI Check
+                for other in row_codes_only:
                     if (other, cpt) in data['ncci'] and not any(m in ['59', '25', '91'] for m in mods):
                         cpt_errors.append(f"🚫 Bundled with {other}")
             
@@ -61,15 +82,16 @@ def run_validation(df, data):
                 row_summary.append(f"[{cpt}]: " + " | ".join(cpt_errors))
                 rejection_reasons.append(cpt)
             else:
-                row_summary.append(f"[{cpt}]: ✅ Clean")
+                row_summary.append(f"[{cpt}]: ✅ Clean ({u} units)")
 
         res_row = row.to_dict()
         res_row['Validation_Results'] = " | ".join(row_summary)
         res_row['Status'] = "REJECTED" if is_rejected else "ACCEPTED"
         results.append(res_row)
+        
     return pd.DataFrame(results), rejection_reasons
 
-# --- 4. UI ---
+# --- 4. UI INTERFACE ---
 st.title("🏥 Billing Scrubber & Trend Analytics")
 
 with st.sidebar:
@@ -82,7 +104,7 @@ with st.sidebar:
 
 if master_file and claim_file:
     data = load_master_data(master_file)
-    if data and st.button("🚀 Run Comprehensive Audit"):
+    if data and st.button("🚀 Run Audit"):
         input_df = pd.read_excel(claim_file)
         final_df, error_codes = run_validation(input_df, data)
         
@@ -96,7 +118,7 @@ if master_file and claim_file:
             st.subheader("📈 Top Codes Causing Rejections")
             counts = pd.Series(error_codes).value_counts().reset_index()
             counts.columns = ['CPT Code', 'Error Count']
-            st.bar_chart(data=counts, x='CPT Code', y='Error Count')
+            st.bar_chart(data=counts, x='CPT Code', y='Error Count', color="#FF4B4B")
         
         tab1, tab2 = st.tabs(["❌ Rejected Claims", "✅ Accepted Claims"])
         with tab1: st.dataframe(final_df[final_df['Status'] == 'REJECTED'], use_container_width=True)
@@ -104,4 +126,4 @@ if master_file and claim_file:
         
         buffer = io.BytesIO()
         final_df.to_excel(buffer, index=False)
-        st.download_button("📥 Export Results", buffer.getvalue(), "Scrubbed_Audit.xlsx")
+        st.download_button("📥 Export Final Results", buffer.getvalue(), "Scrubbed_Audit.xlsx")
