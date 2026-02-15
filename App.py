@@ -1,15 +1,16 @@
 import streamlit as st
 import pandas as pd
 import io
+import os
 import google.generativeai as genai
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Billing AI Scrubber", layout="wide")
 
-# --- DATA CLEANING HELPER ---
+# --- DATA CLEANING HELPER (CRITICAL FOR VALIDATION) ---
 def clean_code(val):
-    """Strips .0 and whitespace from codes like 11042.0"""
-    if pd.isna(val): return ""
+    """Strips .0 and whitespace to ensure 11042.0 becomes 11042"""
+    if pd.isna(val) or val == "": return ""
     s = str(val).strip().upper()
     if s.endswith('.0'): s = s[:-2]
     return s
@@ -23,6 +24,7 @@ def load_master_data(uploaded_master):
             mue_df = pd.read_excel(xls, 'MUE_Edits', skiprows=3)
             ncci_df = pd.read_excel(xls, 'NCCI_Edits')
             
+        # We clean the master data as we load it to ensure perfect matches
         mue_dict = dict(zip(cpt_df.iloc[:, 0].apply(clean_code), mue_df.iloc[:, 1]))
         ncci_bundles = {(clean_code(r[0]), clean_code(r[1])): str(r[5]) for _, r in ncci_df.iterrows()}
         valid_cpts = set(cpt_df.iloc[:, 0].apply(clean_code))
@@ -32,16 +34,20 @@ def load_master_data(uploaded_master):
         st.error(f"Error reading master file: {e}")
         return None
 
-# --- AI DENIAL PREDICTOR ---
+# --- AI DENIAL PREDICTOR (FIXED 404 ERROR) ---
 def get_ai_prediction(cpt_list, dx_list, api_key):
     if not api_key or not cpt_list: return "N/A", "N/A"
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
+        # Using the updated, stable model name
+        model = genai.GenerativeModel('gemini-1.5-flash') 
+        
         prompt = f"Analyze CPTs {cpt_list} with DX {dx_list}. Predict denial risk for medical necessity. Format: RISK: [High/Medium/Low] | REASON: [Short explanation]"
-        response = model.generate_content(prompt).text
-        risk = "High" if "High" in response else ("Medium" if "Medium" in response else "Low")
-        return risk, response
+        response = model.generate_content(prompt)
+        res_text = response.text
+        
+        risk = "High" if "High" in res_text else ("Medium" if "Medium" in res_text else "Low")
+        return risk, res_text
     except Exception as e:
         return "AI Error", str(e)
 
@@ -49,14 +55,18 @@ def get_ai_prediction(cpt_list, dx_list, api_key):
 def run_validation(df, data):
     results = []
     cpt_cols = [c for c in df.columns if 'CPT' in str(c).upper()]
+    
     for _, row in df.iterrows():
         units = row.get('Units', 1)
         mods = [m.strip().upper() for m in str(row.get('Modifier', '')).replace(',', ' ').split() if m.strip()]
-        row_cpts = [clean_code(row[c]) for c in cpt_cols if pd.notna(row[c])]
+        
+        # Clean the input codes before comparing to master data
+        row_cpts = [clean_code(row[c]) for c in cpt_cols if pd.notna(row[c]) and str(row[c]).strip() != ""]
         
         row_status, error_count = [], 0
         for cpt in row_cpts:
-            if cpt.isdigit() and len(cpt) < 5: cpt = cpt.zfill(5) # Anesthesia padding
+            if cpt.isdigit() and len(cpt) < 5: cpt = cpt.zfill(5)
+            
             status_parts = []
             if cpt not in data['valid_cpts']:
                 status_parts.append("❌ Invalid CPT")
@@ -69,6 +79,7 @@ def run_validation(df, data):
                     if (other, cpt) in data['ncci'] and not any(m in ['59', '25', '91'] for m in mods):
                         status_parts.append(f"🚫 Bundled with {other}")
                         error_count += 1
+            
             row_status.append(f"[{cpt}]: " + ("✅ Clean" if not status_parts else " | ".join(status_parts)))
 
         res = row.to_dict()
@@ -113,7 +124,7 @@ if master_file and claim_file:
         m2.metric("Accepted ✅", len(processed_df[processed_df['Status'] == 'ACCEPTED']))
         m3.metric("Rejected ❌", len(processed_df[processed_df['Status'] == 'REJECTED']))
 
-        st.subheader("📋 Results")
+        st.subheader("📋 Results Preview")
         st.dataframe(processed_df)
         
         buffer = io.BytesIO()
