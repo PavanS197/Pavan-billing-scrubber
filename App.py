@@ -7,29 +7,15 @@ import google.generativeai as genai
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Billing AI Scrubber", layout="wide")
 
-# --- IMPROVED DATA CLEANING (FIXES INVALID CPT ERRORS) ---
+# --- POWERFUL DATA CLEANING (FIXES INVALID CPT ERRORS) ---
 def clean_code(val):
-    """
-    Standardizes CPT/DX codes:
-    - Removes .0 from Excel floats
-    - Handles leading zeros for Anesthesia
-    - Strips whitespace
-    """
     if pd.isna(val) or str(val).strip() == "": 
         return ""
-    
-    # Convert to string and strip spaces
-    s = str(val).strip().upper()
-    
-    # Remove trailing .0 from float-style strings
-    if s.endswith('.0'):
-        s = s[:-2]
-    
-    # Padding for Anesthesia: If it's a numeric code less than 5 digits
+    # Remove .0, strip spaces, and uppercase
+    s = str(val).split('.')[0].strip().upper()
+    # Padding for Anesthesia: restore leading zeros (e.g., 100 -> 00100)
     if s.isdigit() and len(s) < 5:
-        # Only pad if it's likely a procedure code, not a unit count
         s = s.zfill(5)
-        
     return s
 
 # --- AI DENIAL PREDICTOR (STABLE VERSION) ---
@@ -48,7 +34,7 @@ def get_ai_prediction(cpt_list, dx_list, api_key):
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('models/gemini-1.5-flash-latest')
-        prompt = f"Analyze CPTs {cpt_list} with DX {dx_list}. Predict denial risk for medical necessity. Format: RISK: [High/Medium/Low] | REASON: [Short explanation]"
+        prompt = f"Analyze CPTs {cpt_list} with DX {dx_list}. Predict denial risk. Format: RISK: [High/Medium/Low] | REASON: [Short explanation]"
         response = model.generate_content(prompt)
         res_text = response.text
         risk = "High" if "High" in res_text else ("Medium" if "Medium" in res_text else "Low")
@@ -56,19 +42,24 @@ def get_ai_prediction(cpt_list, dx_list, api_key):
     except Exception as e:
         return "AI Error", str(e)
 
-# --- CACHED DATA LOADING ---
+# --- CACHED DATA LOADING (IMPROVED MATCHING) ---
 @st.cache_data
 def load_master_data(uploaded_master):
     try:
         with pd.ExcelFile(uploaded_master) as xls:
-            cpt_df = pd.read_excel(xls, 'CPTHCPCS CODE', skiprows=3)
-            mue_df = pd.read_excel(xls, 'MUE_Edits', skiprows=3)
-            ncci_df = pd.read_excel(xls, 'NCCI_Edits')
+            # 1. Load CPT Master (Sheet: CPTHCPCS CODE)
+            # We read the whole sheet and look for the first column to avoid header issues
+            cpt_df = pd.read_excel(xls, 'CPTHCPCS CODE')
+            valid_cpts = set(cpt_df.iloc[:, 0].dropna().apply(clean_code))
             
-        # Standardize Master Data CPTs
-        mue_dict = dict(zip(cpt_df.iloc[:, 0].apply(clean_code), mue_df.iloc[:, 1]))
-        ncci_bundles = {(clean_code(r[0]), clean_code(r[1])): str(r[5]) for _, r in ncci_df.iterrows()}
-        valid_cpts = set(cpt_df.iloc[:, 0].apply(clean_code))
+            # 2. Load MUE (Sheet: MUE_Edits)
+            mue_df = pd.read_excel(xls, 'MUE_Edits')
+            # Using column 0 for code and column 1 for value
+            mue_dict = dict(zip(mue_df.iloc[:, 0].apply(clean_code), mue_df.iloc[:, 1]))
+            
+            # 3. Load NCCI (Sheet: NCCI_Edits)
+            ncci_df = pd.read_excel(xls, 'NCCI_Edits')
+            ncci_bundles = {(clean_code(r[0]), clean_code(r[1])): str(r[5]) for _, r in ncci_df.iterrows()}
         
         return {"mue": mue_dict, "ncci": ncci_bundles, "valid_cpts": valid_cpts}
     except Exception as e:
@@ -78,7 +69,9 @@ def load_master_data(uploaded_master):
 # --- SCRUBBING LOGIC ---
 def run_validation(df, data):
     results = []
+    # Identify CPT columns
     cpt_cols = [c for c in df.columns if 'CPT' in str(c).upper()]
+    
     for _, row in df.iterrows():
         units = row.get('Units', 1)
         mods = [m.strip().upper() for m in str(row.get('Modifier', '')).replace(',', ' ').split() if m.strip()]
@@ -87,6 +80,7 @@ def run_validation(df, data):
         row_status, error_count = [], 0
         for cpt in row_cpts:
             status_parts = []
+            # Check against the master set
             if cpt not in data['valid_cpts']:
                 status_parts.append("❌ Invalid CPT")
                 error_count += 1
@@ -112,14 +106,13 @@ st.title("🏥 Billing AI Scrubber")
 with st.sidebar:
     st.header("🔑 AI Settings")
     api_key = st.text_input("Gemini API Key", type="password")
-    
     if api_key:
         if check_ai_status(api_key):
             st.markdown("🟢 **AI Connection: Active**")
         else:
             st.markdown("🔴 **AI Connection: Failed**")
-    
     use_ai = st.checkbox("Enable AI Denial Predictor")
+    
     st.header("📂 Data Upload")
     master_file = st.file_uploader("Upload Master Data", type=['xlsx'])
     claim_file = st.file_uploader("Upload Claim List", type=['xlsx'])
