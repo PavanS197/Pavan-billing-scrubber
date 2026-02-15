@@ -3,5 +3,4 @@ pandas
 openpyxl
 matplotlib
 altair<5
-google-generativeai>=0.8.0
-
+google-generativeai>=0.7.2
