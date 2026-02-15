@@ -7,18 +7,18 @@ import google.generativeai as genai
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Billing AI Scrubber", layout="wide")
 
-# --- POWERFUL DATA CLEANING (FIXES INVALID CPT ERRORS) ---
+# --- 1. THE ULTIMATE CLEANER ---
 def clean_code(val):
     if pd.isna(val) or str(val).strip() == "": 
         return ""
-    # Remove .0, strip spaces, and uppercase
+    # Remove .0, strip spaces, convert to upper string
     s = str(val).split('.')[0].strip().upper()
-    # Padding for Anesthesia: restore leading zeros (e.g., 100 -> 00100)
+    # Handle leading zeros for Anesthesia (100 -> 00100)
     if s.isdigit() and len(s) < 5:
         s = s.zfill(5)
     return s
 
-# --- AI DENIAL PREDICTOR (STABLE VERSION) ---
+# --- 2. AI AGENT SETUP (STABLE) ---
 def check_ai_status(api_key):
     if not api_key: return False
     try:
@@ -29,122 +29,120 @@ def check_ai_status(api_key):
     except:
         return False
 
-def get_ai_prediction(cpt_list, dx_list, api_key):
-    if not api_key or not cpt_list: return "N/A", "N/A"
+def get_ai_prediction(cpts, dxs, api_key):
+    if not api_key or not cpts: return "Low", "N/A"
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('models/gemini-1.5-flash-latest')
-        prompt = f"Analyze CPTs {cpt_list} with DX {dx_list}. Predict denial risk. Format: RISK: [High/Medium/Low] | REASON: [Short explanation]"
+        prompt = f"Analyze CPTs {cpts} with DX {dxs}. Predict denial risk for medical necessity. Format: RISK: [High/Medium/Low] | REASON: [Short explanation]"
         response = model.generate_content(prompt)
-        res_text = response.text
-        risk = "High" if "High" in res_text else ("Medium" if "Medium" in res_text else "Low")
-        return risk, res_text
+        res = response.text
+        risk = "High" if "High" in res else ("Medium" if "Medium" in res else "Low")
+        return risk, res
     except Exception as e:
-        return "AI Error", str(e)
+        return "Error", str(e)
 
-# --- CACHED DATA LOADING (IMPROVED MATCHING) ---
-@st.cache_data
-def load_master_data(uploaded_master):
+# --- 3. ROBUST MASTER LOADER (THE CACHE FIX) ---
+@st.cache_data(show_spinner=False)
+def load_master_data(uploaded_file):
     try:
-        with pd.ExcelFile(uploaded_master) as xls:
-            # 1. Load CPT Master (Sheet: CPTHCPCS CODE)
-            # We read the whole sheet and look for the first column to avoid header issues
+        with pd.ExcelFile(uploaded_file) as xls:
+            # Load CPT Master - Scan ALL columns in sheet
             cpt_df = pd.read_excel(xls, 'CPTHCPCS CODE')
-            valid_cpts = set(cpt_df.iloc[:, 0].dropna().apply(clean_code))
+            all_valid_codes = set()
+            for col in cpt_df.columns:
+                all_valid_codes.update(cpt_df[col].dropna().apply(clean_code))
             
-            # 2. Load MUE (Sheet: MUE_Edits)
+            # Load MUE
             mue_df = pd.read_excel(xls, 'MUE_Edits')
-            # Using column 0 for code and column 1 for value
-            mue_dict = dict(zip(mue_df.iloc[:, 0].apply(clean_code), mue_df.iloc[:, 1]))
+            mue_map = dict(zip(mue_df.iloc[:, 0].apply(clean_code), mue_df.iloc[:, 1]))
             
-            # 3. Load NCCI (Sheet: NCCI_Edits)
+            # Load NCCI
             ncci_df = pd.read_excel(xls, 'NCCI_Edits')
-            ncci_bundles = {(clean_code(r[0]), clean_code(r[1])): str(r[5]) for _, r in ncci_df.iterrows()}
-        
-        return {"mue": mue_dict, "ncci": ncci_bundles, "valid_cpts": valid_cpts}
+            ncci_map = {(clean_code(r[0]), clean_code(r[1])): str(r[5]) for _, r in ncci_df.iterrows()}
+            
+        return {"valid_cpts": all_valid_codes, "mue": mue_map, "ncci": ncci_map}
     except Exception as e:
-        st.error(f"Error reading master file: {e}")
+        st.error(f"Master Data Error: {e}")
         return None
 
-# --- SCRUBBING LOGIC ---
-def run_validation(df, data):
-    results = []
-    # Identify CPT columns
-    cpt_cols = [c for c in df.columns if 'CPT' in str(c).upper()]
-    
-    for _, row in df.iterrows():
-        units = row.get('Units', 1)
-        mods = [m.strip().upper() for m in str(row.get('Modifier', '')).replace(',', ' ').split() if m.strip()]
-        row_cpts = [clean_code(row[c]) for c in cpt_cols if pd.notna(row[c]) and str(row[c]).strip() != ""]
-        
-        row_status, error_count = [], 0
-        for cpt in row_cpts:
-            status_parts = []
-            # Check against the master set
-            if cpt not in data['valid_cpts']:
-                status_parts.append("❌ Invalid CPT")
-                error_count += 1
-            else:
-                if cpt in data['mue'] and units > data['mue'][cpt]:
-                    status_parts.append(f"⚠️ MUE Violation")
-                    error_count += 1
-                for other in row_cpts:
-                    if (other, cpt) in data['ncci'] and not any(m in ['59', '25', '91'] for m in mods):
-                        status_parts.append(f"🚫 Bundled with {other}")
-                        error_count += 1
-            row_status.append(f"[{cpt}]: " + ("✅ Clean" if not status_parts else " | ".join(status_parts)))
-
-        res = row.to_dict()
-        res['Validation_Results'] = " | ".join(row_status)
-        res['Status'] = "REJECTED" if error_count >= 1 else "ACCEPTED"
-        results.append(res)
-    return pd.DataFrame(results)
-
-# --- UI INTERFACE ---
+# --- 4. UI AND PROCESSING ---
 st.title("🏥 Billing AI Scrubber")
 
 with st.sidebar:
-    st.header("🔑 AI Settings")
-    api_key = st.text_input("Gemini API Key", type="password")
-    if api_key:
-        if check_ai_status(api_key):
-            st.markdown("🟢 **AI Connection: Active**")
-        else:
-            st.markdown("🔴 **AI Connection: Failed**")
-    use_ai = st.checkbox("Enable AI Denial Predictor")
+    st.header("⚙️ AI & Data Settings")
+    key = st.text_input("Gemini API Key", type="password")
+    if key:
+        if check_ai_status(key): st.success("🟢 AI Online")
+        else: st.error("🔴 AI Offline")
     
-    st.header("📂 Data Upload")
-    master_file = st.file_uploader("Upload Master Data", type=['xlsx'])
-    claim_file = st.file_uploader("Upload Claim List", type=['xlsx'])
+    use_ai = st.checkbox("Predict Denial Risk (AI)")
+    
+    # ADDED: Button to clear cache if "Invalid CPT" persists
+    if st.button("♻️ Clear App Cache"):
+        st.cache_data.clear()
+        st.rerun()
+
+    master_file = st.file_uploader("Upload Billing_Master_Data.xlsx", type=['xlsx'])
+    claim_file = st.file_uploader("Upload Claim_Entry.xlsx", type=['xlsx'])
 
 if master_file and claim_file:
     data = load_master_data(master_file)
-    if data and st.button("🚀 Run Scrubber"):
-        input_df = pd.read_excel(claim_file)
-        processed_df = run_validation(input_df, data)
+    if data and st.button("🚀 Start Billing Audit"):
+        claims_df = pd.read_excel(claim_file)
         
-        if use_ai and api_key:
-            with st.spinner("🤖 AI analyzing medical necessity..."):
-                dx_cols = [c for c in input_df.columns if 'DX' in str(c).upper()]
-                risks, insights = [], []
-                for _, row in processed_df.iterrows():
-                    cpts = [clean_code(row[c]) for c in input_df.columns if 'CPT' in str(c).upper() and pd.notna(row[c])]
-                    dxs = [clean_code(row[c]) for c in dx_cols if pd.notna(row[c])]
-                    r, ins = get_ai_prediction(cpts, dxs, api_key)
-                    risks.append(r)
-                    insights.append(ins)
-                processed_df['Risk_Level'] = risks
-                processed_df['AI_Insight'] = insights
-
-        st.subheader("📊 Summary")
+        # --- SCRUBBING ENGINE ---
+        results = []
+        cpt_cols = [c for c in claims_df.columns if 'CPT' in str(c).upper()]
+        dx_cols = [c for c in claims_df.columns if 'DX' in str(c).upper()]
+        
+        for i, row in claims_df.iterrows():
+            units = row.get('Units', 1)
+            mods = [m.strip().upper() for m in str(row.get('Modifier', '')).replace(',', ' ').split() if m.strip()]
+            row_cpts = [clean_code(row[c]) for c in cpt_cols if pd.notna(row[c]) and str(row[c]).strip() != ""]
+            row_dxs = [clean_code(row[c]) for c in dx_cols if pd.notna(row[c]) and str(row[c]).strip() != ""]
+            
+            status_msg, errors = [], 0
+            for cpt in row_cpts:
+                if cpt not in data['valid_cpts']:
+                    status_msg.append(f"[{cpt}]: ❌ Invalid CPT")
+                    errors += 1
+                else:
+                    msg = []
+                    # MUE Check
+                    if cpt in data['mue'] and units > data['mue'][cpt]:
+                        msg.append("⚠️ MUE Violation")
+                        errors += 1
+                    # NCCI Check
+                    for other in row_cpts:
+                        if (other, cpt) in data['ncci'] and not any(m in ['59', '25', '91'] for m in mods):
+                            msg.append(f"🚫 Bundled with {other}")
+                            errors += 1
+                    
+                    status_msg.append(f"[{cpt}]: " + ("✅ Clean" if not msg else " | ".join(msg)))
+            
+            res_row = row.to_dict()
+            res_row['Validation_Results'] = " | ".join(status_msg)
+            res_row['Status'] = "REJECTED" if errors > 0 else "ACCEPTED"
+            
+            # AI Logic
+            if use_ai and key:
+                risk, insight = get_ai_prediction(row_cpts, row_dxs, key)
+                res_row['Risk_Level'] = risk
+                res_row['AI_Insight'] = insight
+            
+            results.append(res_row)
+        
+        # --- DASHBOARD & DOWNLOAD ---
+        final_df = pd.DataFrame(results)
+        st.subheader("📊 Audit Summary")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Claims", len(processed_df))
-        m2.metric("Accepted ✅", len(processed_df[processed_df['Status'] == 'ACCEPTED']))
-        m3.metric("Rejected ❌", len(processed_df[processed_df['Status'] == 'REJECTED']))
-
-        st.subheader("📋 Results Preview")
-        st.dataframe(processed_df)
+        m1.metric("Processed", len(final_df))
+        m2.metric("Accepted ✅", len(final_df[final_df['Status'] == 'ACCEPTED']))
+        m3.metric("Rejected ❌", len(final_df[final_df['Status'] == 'REJECTED']))
+        
+        st.dataframe(final_df)
         
         buffer = io.BytesIO()
-        processed_df.to_excel(buffer, index=False)
-        st.download_button("📥 Download Results", buffer.getvalue(), "Scrubbed_AI_Results.xlsx")
+        final_df.to_excel(buffer, index=False)
+        st.download_button("📥 Download Audit Report", buffer.getvalue(), "Scrubbed_AI_Results.xlsx")
