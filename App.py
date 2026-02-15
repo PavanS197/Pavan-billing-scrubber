@@ -4,7 +4,7 @@ import io
 import time
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Pavan's Claim Scrubber", layout="wide")
+st.set_page_config(page_title="Namma Throttle Scrubber", layout="wide")
 
 # --- CACHED DATA LOADING ---
 @st.cache_data
@@ -16,9 +16,14 @@ def load_master_data(uploaded_master):
             mue_df = pd.read_excel(xls, 'MUE_Edits', skiprows=3)
             ncci_df = pd.read_excel(xls, 'NCCI_Edits')
             
-        mue_dict = dict(zip(mue_df.iloc[:, 0].astype(str).str.strip().upper(), mue_df.iloc[:, 1]))
+        # FIX: Added .str before .upper() for Series operations
+        mue_dict = dict(zip(mue_df.iloc[:, 0].astype(str).str.strip().str.upper(), mue_df.iloc[:, 1]))
+        
+        # NCCI logic uses iterrows (single strings), so .upper() works fine there
         ncci_bundles = {(str(r[0]).strip().upper(), str(r[1]).strip().upper()): str(r[5]) for _, r in ncci_df.iterrows()}
-        valid_cpts = set(cpt_df.iloc[:, 0].astype(str).str.strip().upper())
+        
+        # FIX: Added .str before .upper() here as well
+        valid_cpts = set(cpt_df.iloc[:, 0].astype(str).str.strip().str.upper())
         
         return {"mue": mue_dict, "ncci": ncci_bundles, "valid_cpts": valid_cpts}
     except Exception as e:
@@ -31,12 +36,10 @@ def run_validation_with_progress(df, data):
     cpt_cols = [c for c in df.columns if 'CPT' in str(c).upper()]
     total_rows = len(df)
     
-    # Initialize Progress Bar and Status Text
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, row in df.iterrows():
-        # Update progress every row
         percent_complete = (i + 1) / total_rows
         progress_bar.progress(percent_complete)
         status_text.text(f"Scrubbing Claim {i+1} of {total_rows}...")
@@ -70,12 +73,8 @@ def run_validation_with_progress(df, data):
         res['Status'] = "REJECTED" if error_count >= 1 else "ACCEPTED"
         results.append(res)
     
-    # Cleanup progress bar when done
-    status_text.success(f"Successfully processed {total_rows} claims!")
-    time.sleep(1) # Brief pause so the user sees the 100% completion
     progress_bar.empty()
     status_text.empty()
-    
     return pd.DataFrame(results)
 
 # --- APP INTERFACE ---
@@ -83,9 +82,8 @@ st.title("🏥 Billing Scrubber")
 
 with st.sidebar:
     st.header("📂 Data Upload")
-    master_file = st.file_uploader("1. Upload Master Data (48MB File)", type=['xlsx'])
+    master_file = st.file_uploader("1. Upload Master Data (Excel)", type=['xlsx'])
     claim_file = st.file_uploader("2. Upload Claim Entry List", type=['xlsx'])
-    st.info("Note: First-time upload of 48MB file may take 10-20 seconds.")
 
 if master_file and claim_file:
     with st.spinner("Extracting Master Logic..."):
@@ -96,11 +94,13 @@ if master_file and claim_file:
             input_df = pd.read_excel(claim_file)
             processed_df = run_validation_with_progress(input_df, data)
             
-            st.subheader("Preview Results")
-            st.dataframe(processed_df[['Claim_ID', 'Status', 'Validation_Results']].head(20))
+            # --- SUMMARY STATISTICS ---
+            st.subheader("📊 Scrubbing Summary")
+            total = len(processed_df)
+            accepted = len(processed_df[processed_df['Status'] == 'ACCEPTED'])
+            rejected = len(processed_df[processed_df['Status'] == 'REJECTED'])
             
-            buffer = io.BytesIO()
-            processed_df.to_excel(buffer, index=False)
-            st.download_button("📥 Download Results", buffer.getvalue(), "Scrubbed_Results.xlsx")
-else:
-    st.info("Please upload both files to start.")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Claims", total)
+            col2.metric("Accepted ✅", accepted, f"{int((accepted/total)*100)}%")
+            col3
