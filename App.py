@@ -1,81 +1,107 @@
 import streamlit as st
 import pandas as pd
 import io
-import matplotlib.pyplot as plt
+import os
 
-# --- PREVIOUS SCRUBBER LOGIC CLASS (Integrated) ---
-class BillingScrubber:
-    def __init__(self, master_file):
-        with pd.ExcelFile(master_file) as xls:
-            # Load CPT/HCPCS/MUE/NCCI/ICD-10/Modifiers
-            cpt_df = self.load_sheet_auto(xls, 'CPTHCPCS CODE', 'CODE')
-            mue_df = self.load_sheet_auto(xls, 'MUE_Edits', 'CODE')
-            ncci_df = self.load_sheet_auto(xls, 'NCCI_Edits', 'COLUMN')
-            icd_df = self.load_sheet_auto(xls, 'ICD-10', 'CODE')
-            mod_df = self.load_sheet_auto(xls, 'Modifier', 'CODE')
-
-            self.valid_cpts = self.normalize_series(cpt_df.iloc[:, 0]).union(
-                self.normalize_series(mue_df.iloc[:, 0])).union(
-                self.normalize_series(ncci_df.iloc[:, 0])).union(
-                self.normalize_series(ncci_df.iloc[:, 1]))
-
-            self.mue_dict = dict(zip(self.normalize_series(mue_df.iloc[:, 0]), mue_df.iloc[:, 1]))
-            self.ncci_bundles = {(self.clean_val(r[0]), self.clean_val(r[1])): str(r[5]).strip() for _, r in ncci_df.iterrows()}
-            self.icd_master = set(self.normalize_series(icd_df.iloc[:, 0], is_dx=True))
-            self.mod_map = dict(zip(self.normalize_series(mod_df['Code']), mod_df['Category'].astype(str)))
-
-    def clean_val(self, val, is_dx=False):
-        if pd.isna(val): return ""
-        s = str(val).strip().upper()
-        if not is_dx and s.isdigit() and len(s) < 5: s = s.zfill(5)
-        if not is_dx and s.endswith('.0'): s = s[:-2]
-        return s.replace('.', '')
-
-    def normalize_series(self, series, is_dx=False):
-        return set(series.apply(lambda x: self.clean_val(x, is_dx)).tolist())
-
-    def load_sheet_auto(self, xls, sheet_name, keyword):
-        for i in range(10):
-            df = pd.read_excel(xls, sheet_name, skiprows=i)
-            df.columns = [str(c).strip() for c in df.columns]
-            if any(keyword in str(c).upper() for c in df.columns): return df
-        return pd.DataFrame()
-
-# --- STREAMLIT UI ---
+# --- CONFIGURATION ---
 st.set_page_config(page_title="Pavan's Claim Scrubber", layout="wide")
+
+# --- CACHED DATA LOADING ---
+@st.cache_data
+def load_master_data(master_path):
+    """Loads and caches the heavy master file from the GitHub repository."""
+    with pd.ExcelFile(master_path) as xls:
+        # Load sheets with dynamic header detection
+        cpt_df = pd.read_excel(xls, 'CPTHCPCS CODE', skiprows=3)
+        mue_df = pd.read_excel(xls, 'MUE_Edits', skiprows=3)
+        ncci_df = pd.read_excel(xls, 'NCCI_Edits')
+        icd_df = pd.read_excel(xls, 'ICD-10')
+        mod_df = pd.read_excel(xls, 'Modifier')
+        
+    # Pre-process for high-speed lookups
+    mue_dict = dict(zip(mue_df.iloc[:, 0].astype(str).str.strip().upper(), mue_df.iloc[:, 1]))
+    ncci_bundles = {(str(r[0]).strip().upper(), str(r[1]).strip().upper()): str(r[5]) for _, r in ncci_df.iterrows()}
+    valid_cpts = set(cpt_df.iloc[:, 0].astype(str).str.strip().upper())
+    
+    return {
+        "mue": mue_dict,
+        "ncci": ncci_bundles,
+        "valid_cpts": valid_cpts,
+        "mods": set(mod_df['Code'].astype(str).str.strip().upper())
+    }
+
+# --- CORE SCRUBBING FUNCTION ---
+def run_validation(df, data):
+    results = []
+    cpt_cols = [c for c in df.columns if 'CPT' in str(c).upper()]
+    
+    for _, row in df.iterrows():
+        units = row.get('Units', 1)
+        mods = [m.strip().upper() for m in str(row.get('Modifier', '')).replace(',', ' ').split() if m.strip()]
+        row_cpts = [str(row[c]).strip().upper() for c in cpt_cols if pd.notna(row[c])]
+        row_status, error_count = [], 0
+
+        for cpt in row_cpts:
+            # Automatic Anesthesia Padding (e.g., 100 -> 00100)
+            if cpt.isdigit() and len(cpt) < 5: cpt = cpt.zfill(5)
+            
+            status_parts = []
+            
+            # 1. CPT Validity Check
+            if cpt not in data['valid_cpts']:
+                status_parts.append("❌ Invalid CPT")
+                error_count += 1
+            else:
+                # 2. MUE Validation (Unit Limits)
+                if cpt in data['mue'] and units > data['mue'][cpt]:
+                    status_parts.append(f"⚠️ MUE Violation (Max: {data['mue'][cpt]})")
+                    error_count += 1
+                
+                # 3. NCCI Bundling (Procedure Unbundling)
+                for other in row_cpts:
+                    if (other, cpt) in data['ncci'] and not any(m in ['59', '25', '91'] for m in mods):
+                        status_parts.append(f"🚫 Bundled with {other}")
+                        error_count += 1
+
+            row_status.append(f"[{cpt}]: " + ("✅ Clean" if not status_parts else " | ".join(status_parts)))
+
+        res = row.to_dict()
+        res['Validation_Results'] = " | ".join(row_status)
+        res['Status'] = "REJECTED" if error_count >= 1 else "ACCEPTED"
+        results.append(res)
+        
+    return pd.DataFrame(results)
+
+# --- APP INTERFACE ---
 st.title("🏥 Namma Throttle Billing Scrubber")
-st.markdown("Upload your master data and claim files to identify denial risks instantly.")
+st.markdown("Automated Medical Claim Scrubbing Tool for Windows & Mobile.")
 
-with st.sidebar:
-    st.header("Step 1: Data Setup")
-    master_file = st.file_uploader("Upload Master Data (Excel)", type=['xlsx'])
-    claim_file = st.file_uploader("Upload Claim Entry (Excel)", type=['xlsx'])
+MASTER_FILE = 'Billing_Master_Data.xlsx'
 
-if master_file and claim_file:
-    if st.button("🚀 Start Scrubbing"):
-        with st.spinner("Processing through NCCI and MUE edits..."):
-            scrubber = BillingScrubber(master_file)
-            df = pd.read_excel(claim_file)
-            
-            # (Processing Logic here - utilizing the scrubber class)
-            # ... [Logic remains same as previously optimized script] ...
-            
-            # Display Dashboard
-            st.success("Scrubbing Complete!")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Financial Summary")
-                # summary = ... (calculate summary)
-                # st.table(summary)
-            
-            with col2:
-                st.subheader("Specialty Risk Chart")
-                # st.pyplot(fig)
-            
-            # Download Button
-            output = io.BytesIO()
-            df.to_excel(output, index=False)
-            st.download_button(label="📥 Download Scrubbed Results", data=output.getvalue(), file_name="Scrubbed_Claims.xlsx")
+if os.path.exists(MASTER_FILE):
+    data = load_master_data(MASTER_FILE)
+    st.sidebar.success("✅ Master Data Connected")
+    
+    claim_file = st.file_uploader("Upload Claim_Entry.xlsx", type=['xlsx'])
+    
+    if claim_file:
+        if st.button("🚀 Run Scrubber"):
+            with st.spinner("Analyzing claims against NCCI/MUE edits..."):
+                input_df = pd.read_excel(claim_file)
+                processed_df = run_validation(input_df, data)
+                
+                st.success("Scrubbing Complete!")
+                st.subheader("Results Preview")
+                st.dataframe(processed_df[['Claim_ID', 'Status', 'Validation_Results']].head(15))
+                
+                # Create Excel for Download
+                buffer = io.BytesIO()
+                processed_df.to_excel(buffer, index=False)
+                st.download_button(
+                    label="📥 Download Full Scrubbed Results",
+                    data=buffer.getvalue(),
+                    file_name="Scrubbed_Results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
 else:
-    st.info("Please upload both Excel files in the sidebar to begin.")
+    st.error(f"'{MASTER_FILE}' not found. Please push it to GitHub using GitHub Desktop.")
