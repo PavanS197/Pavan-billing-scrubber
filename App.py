@@ -9,7 +9,9 @@ st.set_page_config(page_title="Billing Scrubber Pro", layout="wide", page_icon="
 def clean_code(val):
     if pd.isna(val) or str(val).strip() == "": 
         return ""
+    # Strip decimals (.0), whitespace, and uppercase
     s = str(val).split('.')[0].strip().upper()
+    # Padding for Anesthesia: restore leading zeros (e.g., 100 -> 00100)
     if s.isdigit() and len(s) < 5:
         s = s.zfill(5)
     return s
@@ -19,12 +21,14 @@ def clean_code(val):
 def load_master_data(uploaded_file):
     try:
         with pd.ExcelFile(uploaded_file) as xls:
+            # Building a master set of all valid codes across all sheets
             all_valid_codes = set()
             for sheet in xls.sheet_names:
                 df_sheet = pd.read_excel(xls, sheet)
                 for col in df_sheet.columns:
                     all_valid_codes.update(df_sheet[col].dropna().apply(clean_code))
             
+            # Load MUE (Units) and NCCI (Bundling) logic
             mue_df = pd.read_excel(xls, 'MUE_Edits') if 'MUE_Edits' in xls.sheet_names else pd.DataFrame()
             ncci_df = pd.read_excel(xls, 'NCCI_Edits') if 'NCCI_Edits' in xls.sheet_names else pd.DataFrame()
             
@@ -43,13 +47,13 @@ def run_validation(df, data):
     rejection_reasons = [] 
     
     for i, row in df.iterrows():
-        # Identify CPT groupings (CPT followed by Units, DX, and Modifiers)
+        # Identify CPT groupings (CPT followed by its own Units, DX, and Modifiers)
         cpt_groups = []
         for idx, col in enumerate(col_names):
             if 'CPT' in col.upper():
                 cpt_val = clean_code(row[col])
                 
-                # Look ahead to find associated data for this CPT
+                # Gather associated data following this CPT column until the next CPT starts
                 units, dxs, mods = 1, [], []
                 j = idx + 1
                 while j < len(col_names) and 'CPT' not in col_names[j].upper():
@@ -85,16 +89,18 @@ def run_validation(df, data):
             
             if cpt:
                 # Check 2: Zero Units
-                if u == 0: cpt_errors.append("❗ Missing Units")
+                if u == 0: 
+                    cpt_errors.append("❗ Missing Units")
                 
-                # Check 3: Invalid CPT
+                # Check 3: Validity
                 if cpt not in data['valid_cpts']:
                     cpt_errors.append("❌ Invalid CPT")
                 else:
-                    # Check 4: MUE
+                    # Check 4: MUE (Units Limit)
                     if cpt in data['mue'] and u > data['mue'][cpt]:
                         cpt_errors.append(f"⚠️ MUE Limit ({data['mue'][cpt]}) - Billed: {u}")
-                    # Check 5: NCCI Bundling
+                    
+                    # Check 5: NCCI Bundling (Requires Modifier check)
                     for other in all_codes_in_row:
                         if (other, cpt) in data['ncci'] and not any(m in ['59', '25', '91'] for m in mods):
                             cpt_errors.append(f"🚫 Bundled with {other}")
@@ -114,16 +120,17 @@ def run_validation(df, data):
         
     return pd.DataFrame(results), rejection_reasons
 
-# --- 4. UI ---
+# --- 4. UI INTERFACE ---
 st.title("🏥 Billing Scrubber Pro")
 
 with st.sidebar:
     st.header("📂 Data Center")
-    master_file = st.file_uploader("1. Master Data", type=['xlsx'])
-    claim_file = st.file_uploader("2. Claim Entry", type=['xlsx'])
-    if st.button("♻️ Reset Cache"):
+    master_file = st.file_uploader("1. Master Data (Excel)", type=['xlsx'])
+    claim_file = st.file_uploader("2. Claim Entry (Excel)", type=['xlsx'])
+    
+    if st.button("♻️ Reset App Cache"):
         st.cache_data.clear()
-        st.rerun()
+        st.success("Cache cleared successfully!")
 
 if master_file and claim_file:
     data = load_master_data(master_file)
@@ -131,24 +138,35 @@ if master_file and claim_file:
         input_df = pd.read_excel(claim_file)
         final_df, error_codes = run_validation(input_df, data)
         
+        # --- METRICS ---
         st.subheader("📊 Performance Summary")
         m1, m2, m3 = st.columns(3)
         m1.metric("Total Rows", len(final_df))
         m2.metric("Accepted ✅", len(final_df[final_df['Status'] == 'ACCEPTED']))
         m3.metric("Rejected ❌", len(final_df[final_df['Status'] == 'REJECTED']), delta_color="inverse")
 
+        # --- TRENDS ---
         if error_codes:
-            st.subheader("📈 Top Denial Hotspots")
+            st.subheader("📈 Top Denial Hotspots (by CPT)")
             counts = pd.Series(error_codes).value_counts().reset_index()
             counts.columns = ['CPT Code', 'Count']
             st.bar_chart(data=counts, x='CPT Code', y='Count', color="#FF4B4B")
         
+        # --- TABBED RESULTS ---
         st.divider()
         tab1, tab2, tab3 = st.tabs(["❌ Rejected Claims", "✅ Accepted Claims", "📂 Full Audit Log"])
-        with tab1: st.dataframe(final_df[final_df['Status'] == 'REJECTED'], use_container_width=True)
-        with tab2: st.dataframe(final_df[final_df['Status'] == 'ACCEPTED'], use_container_width=True)
-        with tab3: st.dataframe(final_df, use_container_width=True)
         
+        with tab1:
+            st.dataframe(final_df[final_df['Status'] == 'REJECTED'], use_container_width=True)
+        with tab2:
+            st.dataframe(final_df[final_df['Status'] == 'ACCEPTED'], use_container_width=True)
+        with tab3:
+            st.dataframe(final_df, use_container_width=True)
+        
+        # --- DOWNLOAD ---
+        st.divider()
         buffer = io.BytesIO()
         final_df.to_excel(buffer, index=False)
-        st.download_button("📥 Download Final Report", buffer.getvalue(), "Billing_Audit_Report.xlsx")
+        st.download_button("📥 Download Final Audit Report", buffer.getvalue(), "Scrubbed_Billing_Report.xlsx")
+else:
+    st.info("Please upload your Master Data and Claim Entry files to begin the audit.")
